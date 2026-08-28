@@ -28,32 +28,38 @@ public:
 
     const std::vector<Task>& tasks() const { return tasks_; }
 
-    void add(std::string title, Priority priority, std::optional<std::time_t> due) {
+    bool add(std::string title, Priority priority, std::optional<std::time_t> due) {
+        auto previous = tasks_;
+        int previousNextId = nextId_;
         tasks_.push_back({nextId_++, std::move(title), false, priority, due});
-        save();
+        return saveOrRestore(std::move(previous), previousNextId);
     }
 
-    void update(int id, std::string title, Priority priority, std::optional<std::time_t> due) {
-        if (Task* task = find(id)) {
-            task->title = std::move(title);
-            task->priority = priority;
-            task->due = due;
-            save();
-        }
+    bool update(int id, std::string title, Priority priority, std::optional<std::time_t> due) {
+        Task* task = find(id);
+        if (!task) return true;
+        auto previous = tasks_;
+        task->title = std::move(title);
+        task->priority = priority;
+        task->due = due;
+        return saveOrRestore(std::move(previous), nextId_);
     }
 
-    void toggle(int id) {
-        if (Task* task = find(id)) {
-            task->completed = !task->completed;
-            save();
-        }
+    bool toggle(int id) {
+        Task* task = find(id);
+        if (!task) return true;
+        auto previous = tasks_;
+        task->completed = !task->completed;
+        return saveOrRestore(std::move(previous), nextId_);
     }
 
-    void remove(int id) {
+    bool remove(int id) {
+        if (!find(id)) return true;
+        auto previous = tasks_;
         tasks_.erase(std::remove_if(tasks_.begin(), tasks_.end(),
                                     [id](const Task& task) { return task.id == id; }),
                      tasks_.end());
-        save();
+        return saveOrRestore(std::move(previous), nextId_);
     }
 
     std::vector<size_t> visible(Filter filter) const {
@@ -93,14 +99,34 @@ private:
         }
     }
 
-    void save() const {
-        std::filesystem::create_directories(path_.parent_path());
-        std::ofstream output(path_, std::ios::trunc);
-        for (const Task& task : tasks_) {
-            output << task.id << ' ' << task.completed << ' '
-                   << static_cast<int>(task.priority) << ' '
-                   << (task.due ? *task.due : 0) << ' '
-                   << std::quoted(task.title) << '\n';
+    bool saveOrRestore(std::vector<Task> previous, int previousNextId) {
+        if (save()) return true;
+        tasks_ = std::move(previous);
+        nextId_ = previousNextId;
+        return false;
+    }
+
+    bool save() const {
+        auto temporary = path_;
+        temporary += ".tmp";
+        try {
+            std::filesystem::create_directories(path_.parent_path());
+            std::ofstream output;
+            output.exceptions(std::ios::failbit | std::ios::badbit);
+            output.open(temporary, std::ios::trunc);
+            for (const Task& task : tasks_) {
+                output << task.id << ' ' << task.completed << ' '
+                       << static_cast<int>(task.priority) << ' '
+                       << (task.due ? *task.due : 0) << ' '
+                       << std::quoted(task.title) << '\n';
+            }
+            output.close();
+            std::filesystem::rename(temporary, path_);
+            return true;
+        } catch (const std::exception&) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            return false;
         }
     }
 };
@@ -318,11 +344,21 @@ static NSString* priorityName(Priority priority) {
     return NO;
 }
 
+- (void)showSaveError {
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = @"Could not save tasks.";
+    alert.informativeText = @"Your previous tasks are unchanged.";
+    [alert beginSheetModalForWindow:_window completionHandler:nil];
+}
+
 - (void)addTask:(id)sender {
     (void)sender;
     if (![self editorIsValid]) return;
-    _store.add(_titleField.stringValue.UTF8String,
-               static_cast<Priority>(_priority.indexOfSelectedItem), [self dueValue]);
+    if (!_store.add(_titleField.stringValue.UTF8String,
+                    static_cast<Priority>(_priority.indexOfSelectedItem), [self dueValue])) {
+        [self showSaveError];
+        return;
+    }
     [self clearEditor];
     [self reload];
 }
@@ -332,8 +368,11 @@ static NSString* priorityName(Priority priority) {
     const Task* task = [self selectedTask];
     if (!task || ![self editorIsValid]) return;
     int id = task->id;
-    _store.update(id, _titleField.stringValue.UTF8String,
-                  static_cast<Priority>(_priority.indexOfSelectedItem), [self dueValue]);
+    if (!_store.update(id, _titleField.stringValue.UTF8String,
+                       static_cast<Priority>(_priority.indexOfSelectedItem), [self dueValue])) {
+        [self showSaveError];
+        return;
+    }
     [self reload];
 }
 
@@ -341,7 +380,10 @@ static NSString* priorityName(Priority priority) {
     (void)sender;
     const Task* task = [self selectedTask];
     if (!task) return;
-    _store.toggle(task->id);
+    if (!_store.toggle(task->id)) {
+        [self showSaveError];
+        return;
+    }
     [self reload];
 }
 
@@ -349,7 +391,10 @@ static NSString* priorityName(Priority priority) {
     (void)sender;
     const Task* task = [self selectedTask];
     if (!task) return;
-    _store.remove(task->id);
+    if (!_store.remove(task->id)) {
+        [self showSaveError];
+        return;
+    }
     [self clearEditor];
     [self reload];
 }
@@ -374,22 +419,46 @@ static NSString* priorityName(Priority priority) {
 static void selfTest() {
     auto path = std::filesystem::temp_directory_path() /
                 ("todo-list-test-" + std::to_string(getpid()) + ".txt");
+    auto temporary = path;
+    temporary += ".tmp";
+    auto due = std::time(nullptr) + 86400;
     {
         TaskStore store(path);
-        store.add("Write tests", Priority::High, std::time(nullptr) + 86400);
-        store.add("Ship app", Priority::Medium, std::nullopt);
+        assert(store.add("Write \"tests\"", Priority::High, due));
+        assert(store.add("Ship app", Priority::Medium, std::nullopt));
         assert(store.tasks().size() == 2);
-        store.toggle(store.tasks()[0].id);
+        assert(store.toggle(store.tasks()[0].id));
         assert(store.visible(Filter::Completed).size() == 1);
-        store.update(store.tasks()[1].id, "Ship desktop app", Priority::High, std::nullopt);
+        assert(store.update(store.tasks()[1].id, "Ship desktop app", Priority::High,
+                            std::nullopt));
+        assert(!std::filesystem::exists(temporary));
     }
     {
         TaskStore loaded(path);
         assert(loaded.tasks().size() == 2);
+        assert(loaded.tasks()[0].id == 1);
+        assert(loaded.tasks()[0].title == "Write \"tests\"");
         assert(loaded.tasks()[0].completed);
+        assert(loaded.tasks()[0].priority == Priority::High);
+        assert(loaded.tasks()[0].due == due);
+        assert(loaded.tasks()[1].id == 2);
         assert(loaded.tasks()[1].title == "Ship desktop app");
-        loaded.remove(loaded.tasks()[0].id);
+        assert(loaded.tasks()[1].priority == Priority::High);
+        assert(!loaded.tasks()[1].due);
+        assert(loaded.remove(loaded.tasks()[0].id));
         assert(loaded.tasks().size() == 1);
+        std::filesystem::create_directory(temporary);
+        assert(!loaded.add("Must roll back", Priority::None, std::nullopt));
+        assert(loaded.tasks().size() == 1);
+        assert(!std::filesystem::exists(temporary));
+        TaskStore unchanged(path);
+        assert(unchanged.tasks().size() == 1);
+        assert(unchanged.tasks()[0].title == "Ship desktop app");
+        assert(loaded.add("After failure", Priority::Low, std::nullopt));
+        assert(loaded.tasks().back().id == 3);
+        TaskStore recovered(path);
+        assert(recovered.tasks().size() == 2);
+        assert(recovered.tasks().back().id == 3);
     }
     std::filesystem::remove(path);
 }
